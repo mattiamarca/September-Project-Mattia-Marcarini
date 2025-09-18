@@ -15,12 +15,8 @@ Repository structure:
 
 - data/ # Input data (public, small processed files)
 
-- results/ # Results (plots, CSV tables, DESeq2 objects
-
 - SeptemberProject.R (Script)
   
 - SeptemberProject.Rmd # RMarkdown report (full pipeline)
-  
-- SeptemberProject.html # Compiled HTML report
   
 - README.md # Project description
