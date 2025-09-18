@@ -1,0 +1,590 @@
+---
+title: "September Programming Project"
+author: "Mattia Marcarini"
+date: "`25-09-2025`"
+output: html_document
+---
+
+# Introduction
+
+In this analysis, two RNA-seq datasets (GSE244485 and GSE244486) are integrated and processed.  
+The goal is to correct for batch effects, perform differential expression analysis, and compare coding and non-coding gene expression.
+
+The main steps include:
+
+1. **Gene Annotation** – preparation of genomic annotations from Ensembl GTF files.  
+2. **PCA** – exploratory analysis to assess the presence of batch effects.  
+3. **Batch Correction & Differential Expression** – batch effect correction with *ComBat-seq* and DE analysis with DESeq2.  
+4. **Heatmap & Clustering** – visualization of the most variable genes after correction.  
+5. **Coding vs Noncoding Genes** – comparison and visualization of top DE genes with violin plots.   
+
+
+```{r step1, message=TRUE}
+###############################################
+# STEP 1: Gene Annotation
+###############################################
+# In this step, we download the GTF file from Ensembl,
+# extract gene annotations, and create 3 objects:
+# - gr_all: all genes
+# - gr_coding: only protein-coding genes
+# - gr_noncoding: only non-coding genes
+
+
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(S4Vectors)
+library(IRanges)
+library(rtracklayer)
+
+
+# Creation of results folder if it doesn't exist
+if(!dir.exists("results")) dir.create("results")
+
+# Downloading GTF from Ensembl Release 114
+gtf_file <- "data/Homo_sapiens.GRCh38.114.gtf.gz"
+if(!file.exists(gtf_file)) {
+message("⬇️ Downloading GTF from Ensembl...")
+download.file(
+url = "https://ftp.ensembl.org/pub/release-114/gtf/homo_sapiens/Homo_sapiens.GRCh38.114.gtf.gz",
+destfile = gtf_file
+)
+message("✅ Download completed.")
+}
+
+# Reading GTF in GRanges
+gtf <- import(gtf_file)
+genes <- gtf[gtf$type == "gene"]
+
+# Keeping only genes with valid gene_id 
+genes <- genes[!is.na(mcols(genes)$gene_id) & mcols(genes)$gene_id != ""]
+
+# Renaming coding genes as ensemblID:geneSymbol
+gene_biotype <- mcols(genes)$gene_biotype
+gene_id     <- mcols(genes)$gene_id
+gene_name   <- mcols(genes)$gene_name
+
+# Updating gene_id column in GRanges
+mcols(genes)$gene_id_updated <- ifelse(
+  gene_biotype == "protein_coding",
+  paste0(gene_id, ":", gene_name),  # coding: ensemblID:geneSymbol
+  gene_id                           # noncoding: solo ensemblID
+)
+
+# Replace the gene_id column with the updated one
+
+mcols(genes)$gene_id <- mcols(genes)$gene_id_updated
+mcols(genes)$gene_id_updated <- NULL
+
+# Saving GRanges complete
+gr_all <- genes
+save(gr_all, file = "data/gr_all.RData")
+
+# Dividing into in coding and noncoding
+gr_coding    <- gr_all[gene_biotype == "protein_coding"]
+gr_noncoding <- gr_all[gene_biotype != "protein_coding"]
+
+# Printing info
+cat("✅ Total genes:", length(gr_all), "\n")
+cat("🧬 Coding genes:", length(gr_coding), "\n")
+cat("🌀 Noncoding genes:", length(gr_noncoding), "\n")
+
+# Saving  subsets
+save(gr_coding, file = "data/gr_coding.RData")
+save(gr_noncoding, file = "data/gr_noncoding.RData")
+cat("💾 Files saved in data/: gr_all.RData, gr_coding.RData, gr_noncoding.RData\n")
+```
+
+```{r step2, message=TRUE}
+###############################################
+# STEP 2: PCA to assess Batch Effect
+###############################################
+# PCA (Principal Component Analysis) allows to reduce dimensionality
+# and observe if samples cluster by biological condition
+# or by batch (indicating a batch effect).
+
+# Load libraries
+
+library(dplyr)
+library(ggplot2)
+library(Biobase)
+
+# Paths to the TSV files in the data subfolder
+
+file1 <- "data/GSE244486_raw_counts.tsv"
+file2 <- "data/GSE244485_raw_counts.tsv"
+
+# Read datasets
+expr1 <- read.table(file1, header = TRUE, sep = "\t", row.names = 1)
+expr2 <- read.table(file2, header = TRUE, sep = "\t", row.names = 1)
+
+cat("Dimensions expr1:", dim(expr1), "\n")
+cat("Dimensions expr2:", dim(expr2), "\n")
+
+# Find common genes
+common_genes <- intersect(rownames(expr1), rownames(expr2))
+cat("Common genes:", length(common_genes), "\n")
+
+if(length(common_genes) == 0){
+  stop("❌ No gene in common between the two datasets. Check platform/annotation.")
+}
+
+# Keep only common genes
+expr1_common <- expr1[common_genes, ]
+expr2_common <- expr2[common_genes, ]
+
+# Combine datasets
+combined_expr <- cbind(expr1_common, expr2_common)
+
+# Transpose for PCA (samples as rows)
+combined_expr_t <- t(combined_expr)
+
+# PCA
+pca_res <- prcomp(combined_expr_t, scale. = TRUE)
+
+# Create dataframe for ggplot
+pca_df <- data.frame(
+  PC1 = pca_res$x[,1],
+  PC2 = pca_res$x[,2],
+  Dataset = rep(c("GSE244486", "GSE244485"),
+                times = c(ncol(expr1_common), ncol(expr2_common)))
+)
+
+# PCA plot
+p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Dataset)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA of GEO datasets", x = "PC1", y = "PC2")
+
+ggsave("results/PCA_plot.png", plot = p, width = 6, height = 5)  # save as PNG
+
+# Calculate centroids of the two datasets
+centroids <- pca_df %>%
+  group_by(Dataset) %>%
+  summarise(PC1_mean = mean(PC1), PC2_mean = mean(PC2))
+
+# Euclidean distance between centroids
+dist_centroids <- sqrt((centroids$PC1_mean[1] - centroids$PC1_mean[2])^2 +
+                         (centroids$PC2_mean[1] - centroids$PC2_mean[2])^2)
+
+cat("Distance between dataset centroids (batch effect proxy):", dist_centroids, "\n")
+
+if(dist_centroids > 5){
+  cat("⚠️ Likely relevant batch effect.\n")
+} else {
+  cat("✅ Minimal batch effect.\n")
+}
+
+print(p) # Show PCA inline in the report
+
+```
+
+```{r step3, message=TRUE}
+###############################################
+# STEP 3: Batch Correction and Differential Expression
+###############################################
+# Batch correction with ComBat-seq and DE analysis with DESeq2
+
+# Step 3.1: If a batch effect is detected (prepare metadata)
+
+library(dplyr)
+
+# Input files
+file1 <- "data/GSE244486_raw_counts.tsv"
+file2 <- "data/GSE244485_raw_counts.tsv"
+
+# Read the two datasets
+expr1 <- read.table(file1, header = TRUE, sep = "\t", row.names = 1)
+expr2 <- read.table(file2, header = TRUE, sep = "\t", row.names = 1)
+
+# Rename columns with batch suffix
+colnames(expr1) <- paste0(colnames(expr1), "_486")
+colnames(expr2) <- paste0(colnames(expr2), "_485")
+
+# Save renamed versions
+write.table(expr1, "data/GSE244486_raw_counts_renamed.tsv",
+            sep = "\t", quote = FALSE, col.names = NA)
+write.table(expr2, "data/GSE244485_raw_counts_renamed.tsv",
+            sep = "\t", quote = FALSE, col.names = NA)
+
+# Build metadata
+samples <- c(colnames(expr1), colnames(expr2))
+conditions <- gsub("_.*", "", samples)  # take the part before "_"
+
+metadata <- data.frame(
+  sample = samples,
+  condition = conditions
+)
+
+# Save metadata
+write.table(metadata, "data/sample_metadata.tsv",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("✅ Created:\n - data/GSE244486_raw_counts_renamed.tsv\n - data/GSE244485_raw_counts_renamed.tsv\n - data/sample_metadata.tsv\n")
+
+# Step 3.2: If a batch effect is detected 
+
+library(data.table)
+library(dplyr)
+library(sva)
+library(DESeq2)
+
+# --- 1: Upload counts ---
+counts_file_486 <- "data/GSE244486_raw_counts_renamed.tsv"
+counts_file_485 <- "data/GSE244485_raw_counts_renamed.tsv"
+
+counts_486 <- fread(counts_file_486, data.table = FALSE)
+rownames(counts_486) <- counts_486[[1]]
+counts_486 <- counts_486[,-1]
+
+counts_485 <- fread(counts_file_485, data.table = FALSE)
+rownames(counts_485) <- counts_485[[1]]
+counts_485 <- counts_485[,-1]
+
+counts_combined <- cbind(counts_486, counts_485)
+colnames(counts_combined) <- make.unique(colnames(counts_combined))
+cat("Dimensions of combined counts:", dim(counts_combined), "\n")
+
+# --- 1b: Load metadata ---
+metadata_file <- "data/sample_metadata.tsv"
+metadata <- fread(metadata_file, data.table = FALSE)
+rownames(metadata) <- metadata$sample
+cat("Dimensions of metadata:", dim(metadata), "\n")
+
+# Keep only common samples
+common_samples <- intersect(colnames(counts_combined), rownames(metadata))
+counts_combined <- counts_combined[, common_samples]
+metadata <- metadata[common_samples, , drop=FALSE]
+cat("Common samples:", length(common_samples), "\n")
+
+# --- 2: Batch correction with ComBat-seq ---
+metadata$batch <- ifelse(grepl("_486", rownames(metadata)), "486", "485")
+combat_counts <- ComBat_seq(as.matrix(counts_combined), batch=metadata$batch, group=metadata$condition)
+cat("Dimensions of combat_counts:", dim(combat_counts), "\n")
+
+# --- 3: DESeq2 on COMBAT-corrected data ---
+dds_combat <- DESeqDataSetFromMatrix(countData = round(combat_counts),
+                                     colData = metadata,
+                                     design = ~ condition)
+dds_combat <- DESeq(dds_combat)
+
+res_infected_combat <- results(dds_combat, contrast=c("condition","infected","mock"))
+res_bystander_combat <- results(dds_combat, contrast=c("condition","bystander","mock"))
+
+write.csv(as.data.frame(res_infected_combat), file="results/results_DE_infected_vs_mock_COMBAT.csv", row.names=TRUE)
+write.csv(as.data.frame(res_bystander_combat), file="results/results_DE_bystander_vs_mock_COMBAT.csv", row.names=TRUE)
+cat("DE results COMBAT saved as CSV\n")
+
+# --- 4: DESeq2 on RAW data including batch as covariate ---
+dds_raw <- DESeqDataSetFromMatrix(countData = round(counts_combined),
+                                  colData = metadata,
+                                  design = ~ batch + condition)
+dds_raw <- DESeq(dds_raw)
+
+res_infected_raw <- results(dds_raw, contrast=c("condition","infected","mock"))
+res_bystander_raw <- results(dds_raw, contrast=c("condition","bystander","mock"))
+
+write.csv(as.data.frame(res_infected_raw), file="results/results_DE_infected_vs_mock_RAW.csv", row.names=TRUE)
+write.csv(as.data.frame(res_bystander_raw), file="results/results_DE_bystander_vs_mock_RAW.csv", row.names=TRUE)
+cat("DE results RAW+batch saved as CSV\n")
+
+# --- 5: Compare COMBAT vs RAW+batch ---
+# Convert to data.frame and add gene names
+df_combat_infected <- as.data.frame(res_infected_combat)
+df_combat_infected$gene <- rownames(df_combat_infected)
+
+df_raw_infected <- as.data.frame(res_infected_raw)
+df_raw_infected$gene <- rownames(df_raw_infected)
+
+compare_infected <- merge(df_combat_infected[, c("gene", "log2FoldChange", "padj")],
+                          df_raw_infected[, c("gene", "log2FoldChange", "padj")],
+                          by="gene",
+                          suffixes=c("_combat", "_raw"))
+
+write.csv(compare_infected, file="results/compare_DE_infected_vs_mock.csv", row.names=FALSE)
+cat("Comparison DE infected vs mock COMBAT vs RAW saved\n")
+
+df_combat_bystander <- as.data.frame(res_bystander_combat)
+df_combat_bystander$gene <- rownames(df_combat_bystander)
+
+df_raw_bystander <- as.data.frame(res_bystander_raw)
+df_raw_bystander$gene <- rownames(df_raw_bystander)
+
+compare_bystander <- merge(df_combat_bystander[, c("gene", "log2FoldChange", "padj")],
+                           df_raw_bystander[, c("gene", "log2FoldChange", "padj")],
+                           by="gene",
+                           suffixes=c("_combat", "_raw"))
+
+write.csv(compare_bystander, file="results/compare_DE_bystander_vs_mock.csv", row.names=FALSE)
+cat("Comparison DE bystander vs mock COMBAT vs RAW saved\n")
+
+# --- Save DESeq2 objects ---
+save(dds_combat, file="results/dds_combat.RData")
+save(dds_raw, file="results/dds_raw.RData")
+cat("DESeq2 objects saved: dds_combat and dds_raw\n")
+
+# Show a preview of results inline
+knitr::kable(head(as.data.frame(res_infected_combat), 10), caption = "Top 10 DE genes (infected vs mock - COMBAT)")
+knitr::kable(head(as.data.frame(res_bystander_combat), 10), caption = "Top 10 DE genes (bystander vs mock - COMBAT)")
+
+
+```
+
+```{r step4, message=TRUE}
+###############################################
+# STEP 4: Heatmap of the most variable genes
+###############################################
+# Visualization of the top 100 most variable genes
+
+# Step 4: Heat Map and Clustering
+
+library(DESeq2)
+library(pheatmap)
+library(matrixStats)
+library(grid)
+library(RColorBrewer)
+
+# --- Load dds_combat ---
+load("results/dds_combat.RData")  # contains dds_combat
+
+# --- Variance stabilizing transformation ---
+vsd <- vst(dds_combat, blind = FALSE)
+
+# --- Select top 100 most variable genes ---
+rv <- matrixStats::rowVars(assay(vsd), useNames = TRUE)
+select <- order(rv, decreasing = TRUE)[1:100]
+
+mat <- assay(vsd)[select, ]
+mat <- mat - rowMeans(mat)
+
+# --- Metadata for annotations ---
+anno <- as.data.frame(colData(dds_combat)[, c("condition","batch")])
+
+# --- More readable color palette ---
+col_fun <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+
+# --- Create heatmap with more space for dendrograms ---
+hm <- pheatmap(mat,
+               annotation_col = anno,
+               show_rownames = FALSE,
+               clustering_distance_rows = "euclidean",
+               clustering_distance_cols = "euclidean",
+               clustering_method = "complete",
+               color = col_fun,
+               main = "Top 100 variable genes - COMBAT corrected",
+               silent = TRUE,
+               treeheight_row = 50,   # row dendrogram height
+               treeheight_col = 50,   # column dendrogram height
+               fontsize_row = 6,      # row text size
+               fontsize_col = 8       # column text size
+)
+
+# --- Save to PDF and PNG ---
+pdf("results/heatmap_top100.pdf", width=12, height=10)  # enlarged
+grid::grid.newpage()
+grid::grid.draw(hm$gtable)
+dev.off()
+
+png("results/heatmap_top100.png", width=1500, height=1200, res=150)
+grid::grid.newpage()
+grid::grid.draw(hm$gtable)
+dev.off()
+
+cat("✅ Heatmap saved in results/heatmap_top100.pdf\n")
+# Show heatmap inline
+pheatmap(mat,
+annotation_col = anno,
+show_rownames = FALSE,
+clustering_distance_rows = "euclidean",
+clustering_distance_cols = "euclidean",
+clustering_method = "complete",
+color = col_fun,
+main = "Top 100 variable genes - COMBAT corrected")
+
+```
+
+```{r step5, message=TRUE}
+###############################################
+# STEP 5: Coding vs Noncoding Genes - Violin Plots
+###############################################
+# Selection of top 5 DE genes for each contrast
+# Visualization of expression distribution with violin plots
+
+library(DESeq2)
+library(GenomicRanges)
+library(BiocGenerics)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ----- 1️⃣ Load DE results from CSV -----
+cat("✅ Loading DE results...\n")
+de_infected <- read.csv("results/results_DE_infected_vs_mock_COMBAT.csv", row.names = 1)
+de_bystander <- read.csv("results/results_DE_bystander_vs_mock_COMBAT.csv", row.names = 1)
+cat("✅ DE results loaded successfully\n")
+
+# ----- 2️⃣ Load GenomicRanges -----
+cat("✅ Loading GenomicRanges...\n")
+load("data/gr_coding.RData")      # coding genes
+load("data/gr_noncoding.RData")   # noncoding genes
+cat("✅ GenomicRanges loaded successfully\n")
+
+# ----- 3️⃣ Load dds_combat object -----
+cat("✅ Loading dds_combat...\n")
+load("results/dds_combat.RData")  # contains dds_combat
+cat("✅ dds_combat loaded successfully\n")
+
+# ----- 4️⃣ VST transformation -----
+cat("✅ Calculating VST...\n")
+vst_obj <- vst(dds_combat, blind = FALSE)
+cat("✅ VST calculated\n")
+
+# ----- 5️⃣ Extract top 5 significant DE genes -----
+cat("✅ Cleaning gene IDs and selecting top 5...\n")
+# Filter significant DE
+de_genes_infected <- rownames(de_infected)[de_infected$padj < 0.05]
+de_genes_bystander <- rownames(de_bystander)[de_bystander$padj < 0.05]
+
+# Intersect with genes present in VST
+de_genes_infected <- intersect(de_genes_infected, rownames(vst_obj))
+de_genes_bystander <- intersect(de_genes_bystander, rownames(vst_obj))
+
+# Order by absolute log2FoldChange and take top 5
+top5_infected <- head(de_genes_infected[order(abs(de_infected[de_genes_infected, "log2FoldChange"]), decreasing = TRUE)], 5)
+top5_bystander <- head(de_genes_bystander[order(abs(de_bystander[de_genes_bystander, "log2FoldChange"]), decreasing = TRUE)], 5)
+cat("✅ Top 5 genes selected\n")
+
+# ----- 6️⃣ Function for violin plot -----
+plot_violin <- function(genes, vst_obj, group_col = "condition", title = "Violin Plot") {
+  mat <- assay(vst_obj)[genes, , drop = FALSE]
+  df <- as.data.frame(t(mat))
+  df$sample <- rownames(df)
+  
+  df_long <- pivot_longer(df, cols = -sample, names_to = "gene", values_to = "expression")
+  df_long$group <- colData(vst_obj)[df_long$sample, group_col]
+  
+  p <- ggplot(df_long, aes(x = gene, y = expression, fill = group)) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.1, fill = "white") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = title, y = "VST expression", x = "Gene")
+  
+  return(p)
+}
+
+# ----- 7️⃣ Generate plots for top 5 -----
+cat("✅ Generating top 5 violin plots...\n")
+p_infected <- plot_violin(top5_infected, vst_obj, group_col = "condition", title = "Top 5 Infected vs Mock")
+p_bystander <- plot_violin(top5_bystander, vst_obj, group_col = "condition", title = "Top 5 Bystander vs Mock")
+
+# Save
+ggsave("results/violin_top5_infected_vs_mock.png", p_infected, width = 10, height = 6)
+ggsave("results/violin_top5_bystander_vs_mock.png", p_bystander, width = 10, height = 6)
+cat("✅ Top 5 violin plots saved in results/\n")
+
+# Show violin plots inline
+print(p_infected)
+print(p_bystander)
+
+
+
+```
+
+# Reproducibility in Docker
+
+This section describes how to reproduce the analysis performed in this report inside Docker.
+
+- Start your Docker
+
+- Using command prompt navigate to the project folder (which should contain `SeptemberProjectScript.R`, `SeptemberProject.rmd`, `data/`, `Dockerfile`, ) with:
+  cd /path/to/project
+
+- Build the docker image using the Dockerfile in the project from command prompt with:
+
+  docker build -t rna-seq-pipeline .
+
+- Be sure that into 'data' folder are present the two datasets (GSE244485_raw_counts.tsv and GSE244486_raw_counts.tsv). If they aren't, download them   from these links ( GSE244486: https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE244486&format=file&file=GSE244486%5Fraw%5Fcounts%2Etsv%2Egz ; 
+                   GSE244485: https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE244485&format=file&file=GSE244485%5Fraw%5Fcounts%2Etsv%2Egz) 
+                   and put them into 'data' folder.
+
+- Start the Docker container with:
+  docker run -it --rm -v %cd%:/home/project rna-seq-pipeline
+
+  (On Linux/macOS, replace `%cd%` with `$(pwd)`)
+
+- Inside the container, start R with:
+  R
+
+- Then render the report with:
+  library(rmarkdown)
+  render("SeptemberProject.rmd")
+
+- The file `SeptemberProject.html` will be generated in the project folder on the host computer.
+
+- Alternatively, without entering R interactively, you can run directly:
+  docker run -it --rm -v %cd%:/home/project rna-seq-pipeline Rscript -e "rmarkdown::render('SeptemberProject.rmd')"
+
+The plots and tables will be visible in the `SeptemberProject.html` file, and the files generated in the `results/` folder will also be accessible on the host computer.
+
+
+
+
+## 🔧 Issues & Workarounds
+
+1. **Missing `data/` folder**  
+   - *Issue*: On the first run, some scripts could not find the `data/` folder.  
+   - *Workaround*: Added a check  
+     ```r
+     if(!dir.exists("data")) dir.create("data")
+     ```  
+     to automatically create the folder.  
+
+2. **Missing or not downloaded GTF file**  
+   - *Issue*: The Ensembl GTF file was not available locally.  
+   - *Workaround*: Conditional download  
+     ```r
+     if(!file.exists(gtf_file)) download.file(url, gtf_file)
+     ```  
+     to fetch the correct Ensembl release.  
+
+3. **Incomplete gene annotation (`NA` in `gene_id`)**  
+   - *Issue*: Some records in the GTF contained missing or empty `gene_id`.  
+   - *Workaround*: Filtered out with  
+     ```r
+     genes <- genes[!is.na(mcols(genes)$gene_id) & mcols(genes)$gene_id != ""]
+     ```  
+
+4. **Duplicate columns in raw counts from GEO datasets**  
+   - *Issue*: After `cbind` of GSE244486 and GSE244485, some sample names were duplicated.  
+   - *Workaround*: Applied  
+     ```r
+     colnames(counts_combined) <- make.unique(colnames(counts_combined))
+     ```  
+     to ensure unique column names.  
+
+6. **Sample alignment between counts and metadata**  
+   - *Issue*: Mismatch between `colnames(counts_combined)` and `rownames(metadata)`.  
+   - *Workaround*: Kept only common samples with  
+     ```r
+     common_samples <- intersect(colnames(counts_combined), rownames(metadata))
+     counts_combined <- counts_combined[, common_samples]
+     metadata <- metadata[common_samples, , drop=FALSE]
+     ```  
+
+7. **Plots with unreadable labels**  
+   - *Issue*: Dendrograms and labels were too small in the heatmap.  
+   - *Workaround*: Adjusted parameters  
+     ```r
+     treeheight_row = 50
+     treeheight_col = 50
+     fontsize_row = 6
+     fontsize_col = 8
+     ```  
+     and exported PDF/PNG in high resolution.  
+
+8. **Selection of top DE genes for violin plots**  
+   - *Issue*: Some significant genes were missing in the `vst` object.  
+   - *Workaround*: Intersected `rownames(vst_obj)` with DE genes filtered by `padj < 0.05`.  
+
+
